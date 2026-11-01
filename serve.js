@@ -9,8 +9,8 @@
 //
 // Payloads split into 3 MB parts under Build/chunks/ are the exception: part
 // 000 happens to start with the gzip magic too, and tagging it would make the
-// service worker hand back a single decoded chunk instead of the raw byte run
-// it needs to concatenate. Those are always served verbatim.
+// browser hand back a single decoded chunk instead of the raw byte run the page
+// needs to concatenate. Those are always served verbatim.
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
@@ -87,8 +87,6 @@ const server = http.createServer((req, res) => {
           'Cache-Control': 'no-cache'
         };
         if (gzipped) headers['Content-Encoding'] = 'gzip';
-        // Lets a service worker at the site root control pages in a subfolder.
-        if (pathname === '/sw.js') headers['Service-Worker-Allowed'] = '/';
 
         const range = req.headers.range;
         if (range) {

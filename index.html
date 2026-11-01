@@ -22,8 +22,264 @@
       #unity-footer { display: none; }
       #unity-warning { max-width: 80vw; }
     </style>
-    <script src="chunk-loader.js"></script>
-    <!-- repu-pack:end -->
+    <script>
+/* REPU page bootstrap.
+ *
+ * The player's payloads are too big for one file, so they are stored as 3 MB
+ * parts under Build/chunks/ and described by Build/chunks/manifest.json. This
+ * script puts them back together inside the page: any fetch for a split
+ * payload is answered with a stream that pulls the parts in order and pipes
+ * them through a gzip decoder. Nothing is registered and nothing is stored, so
+ * it works on plain http://localhost and on file:// pages as well - no service
+ * worker, and therefore no secure-context requirement.
+ *
+ * The framework file is pulled in by Unity with a <script> tag, which the fetch
+ * hook cannot see, so it is fetched and decoded here too.
+ */
+(function () {
+  'use strict';
+
+  var BASE_DIR = new URL('.', document.baseURI).href;
+  var MANIFEST_PATH = 'Build/chunks/manifest.json';
+  var nativeFetch = window.fetch ? window.fetch.bind(window) : null;
+  var manifestPromise = null;
+  var started = false;
+  var instance = null;
+
+  function resolve(path) {
+    return new URL(path, BASE_DIR).href;
+  }
+
+  function banner(message) {
+    console.error('[repu] ' + message);
+    var host = document.querySelector('#unity-warning');
+    if (!host) {
+      return;
+    }
+    var line = document.createElement('div');
+    line.textContent = message;
+    line.style.cssText =
+      'background:#7f1d1d;color:#fff;padding:10px 14px;font:14px/1.4 system-ui,sans-serif;';
+    host.appendChild(line);
+    host.style.display = 'block';
+  }
+
+  /* Turns a URL into the key used by the manifest ("Build/123.data.gz"), or
+   * null when it is not below the folder this page loads its payloads from. */
+  function keyFor(input) {
+    var href = typeof input === 'string' ? input : input && input.url;
+    if (!href) {
+      return null;
+    }
+    var url, base;
+    try {
+      url = new URL(href, BASE_DIR);
+      base = new URL(BASE_DIR);
+    } catch (err) {
+      return null;
+    }
+    if (url.origin !== base.origin || url.pathname.indexOf(base.pathname) !== 0) {
+      return null;
+    }
+    return decodeURIComponent(url.pathname.slice(base.pathname.length)).replace(/^\/+/, '');
+  }
+
+  function loadManifest() {
+    if (!manifestPromise) {
+      manifestPromise = nativeFetch(resolve(MANIFEST_PATH), { cache: 'no-store' }).then(function (res) {
+        if (!res.ok) {
+          throw new Error('chunk manifest -> HTTP ' + res.status);
+        }
+        return res.json();
+      });
+      manifestPromise.catch(function () {
+        manifestPromise = null;
+      });
+    }
+    return manifestPromise;
+  }
+
+  /* One part is opened, read and released at a time, so backpressure from the
+   * consumer (Unity) reaches the network instead of buffering the payload. */
+  function partStream(entry) {
+    var index = 0;
+    var reader = null;
+    var parts = entry.parts;
+    return new ReadableStream({
+      pull: function (controller) {
+        function nextPart() {
+          if (index >= parts.length) {
+            controller.close();
+            return undefined;
+          }
+          var url = resolve(parts[index++]);
+          return nativeFetch(url, { cache: 'no-store' }).then(function (res) {
+            if (!res.ok || !res.body) {
+              throw new Error('chunk part ' + url + ' -> HTTP ' + res.status);
+            }
+            reader = res.body.getReader();
+            return pump();
+          });
+        }
+
+        function pump() {
+          return reader.read().then(function (r) {
+            if (r.done) {
+              reader = null;
+              return nextPart();
+            }
+            controller.enqueue(r.value);
+            return undefined;
+          });
+        }
+
+        return (reader ? pump() : nextPart()).catch(function (err) {
+          console.error('[repu] chunk stream failed:', err);
+          controller.error(err);
+        });
+      },
+      cancel: function (reason) {
+        if (reader) {
+          reader.cancel(reason).catch(function () {});
+          reader = null;
+        }
+      }
+    });
+  }
+
+  function chunkedResponse(entry) {
+    var stream = partStream(entry);
+    if (entry.encoding === 'gzip') {
+      stream = stream.pipeThrough(new DecompressionStream('gzip'));
+    }
+    var headers = new Headers();
+    headers.set('Content-Type', entry.type || 'application/octet-stream');
+    headers.set('Cache-Control', 'no-cache');
+    // Unity sizes its download buffer from Content-Length, so report the
+    // decoded size rather than the on-disk one.
+    if (entry.decoded) {
+      headers.set('Content-Length', String(entry.decoded));
+    }
+    return new Response(stream, { status: 200, statusText: 'OK', headers: headers });
+  }
+
+  function installFetchHook() {
+    if (!nativeFetch || window.__repuFetchHooked) {
+      return;
+    }
+    window.__repuFetchHooked = true;
+
+    window.fetch = function (input, init) {
+      var method = String((init && init.method) || 'GET').toUpperCase();
+      var key = method === 'GET' || method === 'HEAD' ? keyFor(input) : null;
+      if (!key) {
+        return nativeFetch(input, init);
+      }
+      return loadManifest().then(function (manifest) {
+        var entry = manifest.files && manifest.files[key];
+        if (!entry) {
+          return nativeFetch(input, init);
+        }
+        if (method === 'HEAD') {
+          // Unity revalidates its own cache with a HEAD before it reuses it.
+          return new Response(null, {
+            status: 200,
+            headers: { 'Content-Type': entry.type || 'application/octet-stream' }
+          });
+        }
+        return chunkedResponse(entry);
+      });
+    };
+  }
+
+  /* The framework is a single small .gz; decode it and hand Unity a blob URL so
+   * it is treated as plain JavaScript rather than pre-compressed content. */
+  function prepareFramework(config) {
+    return nativeFetch(resolve(config.frameworkUrl)).then(function (res) {
+      if (!res.ok) {
+        throw new Error('framework -> HTTP ' + res.status);
+      }
+      return res.arrayBuffer();
+    }).then(function (buffer) {
+      var head = new Uint8Array(buffer, 0, 2);
+      var source;
+      if (head[0] === 0x1f && head[1] === 0x8b) {
+        source = new Response(
+          new Blob([buffer]).stream().pipeThrough(new DecompressionStream('gzip'))
+        ).text();
+      } else {
+        // A server that already sent Content-Encoding: gzip lands here.
+        source = Promise.resolve(new TextDecoder().decode(buffer));
+      }
+      return source;
+    }).then(function (text) {
+      config.frameworkUrl = URL.createObjectURL(new Blob([text], { type: 'text/javascript' }));
+    });
+  }
+
+  function resizeCanvas() {
+    if (!instance) {
+      return;
+    }
+    var canvas = document.querySelector('#unity-canvas');
+    if (!canvas) {
+      return;
+    }
+    var dpr = window.devicePixelRatio || 1;
+    var w = Math.max(1, Math.round(canvas.clientWidth * dpr));
+    var h = Math.max(1, Math.round(canvas.clientHeight * dpr));
+    if (canvas.width === w && canvas.height === h) {
+      return;
+    }
+    try {
+      // Third argument keeps the element's CSS size alone; the stylesheet
+      // owns that, we only resize the drawing buffer.
+      instance.Module.setCanvasSize(w, h, true);
+    } catch (err) {
+      console.warn('[repu] resize failed:', err);
+    }
+    canvas.style.width = '100%';
+    canvas.style.height = '100%';
+  }
+
+  window.repuOnInstanceReady = function (unityInstance) {
+    instance = unityInstance;
+    window.__repuInstance = unityInstance;
+    var pending = null;
+    window.addEventListener('resize', function () {
+      clearTimeout(pending);
+      pending = setTimeout(resizeCanvas, 120);
+    });
+    window.addEventListener('orientationchange', function () {
+      clearTimeout(pending);
+      pending = setTimeout(resizeCanvas, 300);
+    });
+    resizeCanvas();
+  };
+
+  window.repuStartPlayer = function (config, boot) {
+    if (started) {
+      return;
+    }
+    started = true;
+
+    if (!nativeFetch || typeof DecompressionStream === 'undefined') {
+      banner('This browser cannot reassemble the split game data (it needs fetch and DecompressionStream).');
+      return;
+    }
+
+    installFetchHook();
+    Promise.all([loadManifest(), prepareFramework(config)])
+      .then(function () {
+        boot();
+      })
+      .catch(function (err) {
+        banner('Could not load the game data (' + ((err && err.message) || err) + '). Serve this folder over http://localhost or https and check that Build/chunks is complete.');
+      });
+  };
+})();
+    </script>
+  <!-- repu-pack:end -->
   </head>
   <body>
     <div id="unity-container" class="unity-desktop">
@@ -54,7 +310,7 @@
       // a permanent error message on top of the canvas if type=='error'.
       // If type=='warning', a yellow highlight color is used.
       // Modify or remove this function to customize the visually presented
-      // way that non-critical warnings and error messages are presented to the
+      // way that non-critical warnings and errors are presented to the
       // user.
       function unityShowBanner(msg, type) {
         function updateBannerVisibility() {
@@ -143,7 +399,7 @@
               });
             };
 
-      window.repuStartPlayer(function () { document.body.appendChild(script); });
+      window.repuStartPlayer(config, function () { document.body.appendChild(script); });
 
     </script>
   </body>
